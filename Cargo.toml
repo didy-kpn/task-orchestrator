@@ -1,9 +1,9 @@
 [package]
-name = "priority-task-queue"
+name = "task-orchestrator"
 version = "0.1.0"
 edition = "2021"
 authors = ["Didy <9417799+didy-kpn@users.noreply.github.com>"]
-description = "An asynchronous priority-based task scheduling library"
+description = "An asynchronous task scheduling library"
 license = "MIT"
 
 [dependencies]
