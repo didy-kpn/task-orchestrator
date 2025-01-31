@@ -1,0 +1,10 @@
+debug/
+target/
+
+**/*.rs.bk
+
+Cargo.lock
+
+.env
+.aider*
+.mise.toml

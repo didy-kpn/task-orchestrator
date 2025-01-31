@@ -1,0 +1,12 @@
+[package]
+name = "priority-task-queue"
+version = "0.1.0"
+edition = "2021"
+authors = ["Didy <9417799+didy-kpn@users.noreply.github.com>"]
+description = "An asynchronous priority-based task scheduling library"
+license = "MIT"
+
+[dependencies]
+tokio = { version = "1.43.0", features = ["full"] }
+async-trait = "0.1.85"
+thiserror = "2.0.11"
