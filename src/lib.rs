@@ -220,8 +220,8 @@ mod tests {
         fn clone_box(&self) -> Box<dyn Executable<TestEvent>> {
             Box::new(Self {
                 name: self.name.clone(),
-                mode: self.mode.clone(),
-                status: self.status.clone(),
+                mode: self.mode,
+                status: self.status,
                 status_test: self.status_test.clone(),
                 event: self.event.clone(),
                 received_events: self.received_events.clone(),
