@@ -125,6 +125,10 @@ impl<E: EventType + 'static> Scheduler<E> {
         }
     }
 
+    pub fn event_bus(&self) -> &EventBus<E> {
+        &self.event_bus
+    }
+
     pub fn register_task(&mut self, task: Box<dyn Executable<E>>) {
         self.tasks.push(task);
     }

@@ -13,3 +13,8 @@ thiserror = "2.0.11"
 
 [dev-dependencies]
 tokio = { version = "1.43.0", features = ["full", "rt-multi-thread", "macros"] }
+criterion = { version = "0.5", features = ["html_reports"] }
+
+[[bench]]
+name = "scheduler"
+harness = false
