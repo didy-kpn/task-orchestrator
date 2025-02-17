@@ -2,7 +2,7 @@ use std::{collections::HashMap, hash::Hash};
 
 use async_trait::async_trait;
 use thiserror::Error;
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::broadcast;
 
 #[derive(Error, Debug)]
 pub enum SchedulerError {
@@ -51,7 +51,6 @@ pub trait Executable<E: EventType + 'static>: Send + Sync {
     fn subscribed_event(&self) -> &E;
     async fn handle_event(&mut self, event: String) -> Result<(), SchedulerError>;
 
-    fn message_sender(&self) -> Option<mpsc::Sender<String>>;
 }
 
 #[derive(Debug, Clone)]
@@ -258,9 +257,6 @@ mod tests {
             Ok(())
         }
 
-        fn message_sender(&self) -> Option<mpsc::Sender<String>> {
-            None
-        }
     }
 
     #[tokio::test]

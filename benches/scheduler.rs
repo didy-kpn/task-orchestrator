@@ -81,9 +81,6 @@ impl Executable<BenchEvent> for BenchmarkTask {
         Ok(())
     }
 
-    fn message_sender(&self) -> Option<tokio::sync::mpsc::Sender<String>> {
-        None
-    }
 }
 
 fn scheduler_benchmark(c: &mut Criterion) {
