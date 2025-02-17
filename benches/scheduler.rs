@@ -80,7 +80,6 @@ impl Executable<BenchEvent> for BenchmarkTask {
         self.received_events.lock().await.push(event);
         Ok(())
     }
-
 }
 
 fn scheduler_benchmark(c: &mut Criterion) {

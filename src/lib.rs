@@ -50,7 +50,6 @@ pub trait Executable<E: EventType + 'static>: Send + Sync {
 
     fn subscribed_event(&self) -> &E;
     async fn handle_event(&mut self, event: String) -> Result<(), SchedulerError>;
-
 }
 
 #[derive(Debug, Clone)]
@@ -256,7 +255,6 @@ mod tests {
             self.received_events.lock().await.push(event);
             Ok(())
         }
-
     }
 
     #[tokio::test]
