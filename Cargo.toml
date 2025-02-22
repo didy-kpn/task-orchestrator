@@ -1,7 +1,7 @@
 [package]
 name = "task-orchestrator"
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
 authors = ["Didy <9417799+didy-kpn@users.noreply.github.com>"]
 description = "An asynchronous task scheduling library"
 license = "MIT"
