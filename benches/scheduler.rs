@@ -1,10 +1,9 @@
 use criterion::{Criterion, criterion_group, criterion_main};
 use std::sync::Arc;
 use std::time::Duration;
+use task_orchestrator::*;
 use tokio::runtime::Runtime;
 use tokio::sync::Mutex;
-
-use task_orchestrator::*;
 
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
 enum BenchEvent {
@@ -23,8 +22,6 @@ impl EventType for BenchEvent {}
 
 struct BackgroundBenchmarkTask {
     name: String,
-    status: ExecutionStatus,
-    status_inner: Arc<Mutex<ExecutionStatus>>,
 }
 
 #[async_trait::async_trait]
@@ -33,19 +30,11 @@ impl Executable for BackgroundBenchmarkTask {
         &self.name
     }
 
-    fn status(&self) -> ExecutionStatus {
-        self.status
-    }
-
     async fn initialize(&mut self) -> Result<(), SchedulerError> {
-        *self.status_inner.lock().await = ExecutionStatus::Running;
-        self.status = ExecutionStatus::Running;
         Ok(())
     }
 
     async fn shutdown(&mut self) -> Result<(), SchedulerError> {
-        *self.status_inner.lock().await = ExecutionStatus::Stopped;
-        self.status = ExecutionStatus::Stopped;
         Ok(())
     }
 }
@@ -56,20 +45,10 @@ impl BackgroundTask for BackgroundBenchmarkTask {
         tokio::time::sleep(Duration::from_micros(10)).await;
         Ok(())
     }
-
-    fn clone_box(&self) -> Box<dyn BackgroundTask> {
-        Box::new(Self {
-            name: self.name.clone(),
-            status: self.status,
-            status_inner: self.status_inner.clone(),
-        })
-    }
 }
 
 struct EventDrivenBenchmarkTask {
     name: String,
-    status: ExecutionStatus,
-    status_inner: Arc<Mutex<ExecutionStatus>>,
     event: BenchEvent,
     received_events: Arc<Mutex<Vec<String>>>,
 }
@@ -80,25 +59,17 @@ impl Executable for EventDrivenBenchmarkTask {
         &self.name
     }
 
-    fn status(&self) -> ExecutionStatus {
-        self.status
-    }
-
     async fn initialize(&mut self) -> Result<(), SchedulerError> {
-        *self.status_inner.lock().await = ExecutionStatus::Running;
-        self.status = ExecutionStatus::Running;
         Ok(())
     }
 
     async fn shutdown(&mut self) -> Result<(), SchedulerError> {
-        *self.status_inner.lock().await = ExecutionStatus::Stopped;
-        self.status = ExecutionStatus::Stopped;
         Ok(())
     }
 }
 
 #[async_trait::async_trait]
-impl EventDrivenTask<BenchEvent> for EventDrivenBenchmarkTask {
+impl EventTask<BenchEvent> for EventDrivenBenchmarkTask {
     fn subscribed_event(&self) -> &BenchEvent {
         &self.event
     }
@@ -106,16 +77,6 @@ impl EventDrivenTask<BenchEvent> for EventDrivenBenchmarkTask {
     async fn handle_event(&mut self, event: String) -> Result<(), SchedulerError> {
         self.received_events.lock().await.push(event);
         Ok(())
-    }
-
-    fn clone_box(&self) -> Box<dyn EventDrivenTask<BenchEvent>> {
-        Box::new(Self {
-            name: self.name.clone(),
-            status: self.status,
-            status_inner: self.status_inner.clone(),
-            event: self.event.clone(),
-            received_events: self.received_events.clone(),
-        })
     }
 }
 
@@ -129,19 +90,17 @@ fn scheduler_benchmark(c: &mut Criterion) {
                 let mut scheduler = Scheduler::new(event_bus);
 
                 for i in 0..1000 {
-                    let task = BackgroundBenchmarkTask {
+                    let task = Arc::new(Mutex::new(BackgroundBenchmarkTask {
                         name: format!("bg_task_{}", i),
-                        status: ExecutionStatus::Idle,
-                        status_inner: Arc::new(Mutex::new(ExecutionStatus::Idle)),
-                    };
-                    scheduler.register_background_task(Box::new(task));
+                    }));
+                    scheduler.register_background_task(task);
                 }
 
                 scheduler.start().await.unwrap();
                 tokio::time::sleep(Duration::from_millis(100)).await;
                 scheduler.shutdown().await.unwrap();
             });
-        })
+        });
     });
 
     c.bench_function("handle_10000_events", |b| {
@@ -161,28 +120,23 @@ fn scheduler_benchmark(c: &mut Criterion) {
                     .clone_sender(&BenchEvent::HighPriority)
                     .unwrap();
 
-                // Create event-driven task
-                let task = EventDrivenBenchmarkTask {
+                let task = Arc::new(Mutex::new(EventDrivenBenchmarkTask {
                     name: "event_handler".to_string(),
-                    status: ExecutionStatus::Idle,
-                    status_inner: Arc::new(Mutex::new(ExecutionStatus::Idle)),
                     event: BenchEvent::HighPriority,
                     received_events: Arc::new(Mutex::new(Vec::new())),
-                };
-                scheduler.register_event_driven_task(Box::new(task));
+                }));
+                scheduler.register_event_task(task);
 
                 scheduler.start().await.unwrap();
 
-                // Send events
                 for i in 0..10000 {
                     sender.send(format!("event_{}", i)).unwrap();
                 }
 
-                // Wait for processing
                 tokio::time::sleep(Duration::from_millis(500)).await;
                 scheduler.shutdown().await.unwrap();
             });
-        })
+        });
     });
 }
 

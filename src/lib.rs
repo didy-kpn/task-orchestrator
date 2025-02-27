@@ -1,8 +1,9 @@
-use std::{collections::HashMap, hash::Hash};
+use std::{collections::HashMap, hash::Hash, sync::Arc};
 
 use async_trait::async_trait;
 use thiserror::Error;
-use tokio::sync::broadcast;
+use tokio::sync::{Mutex, broadcast};
+use uuid::Uuid;
 
 #[derive(Error, Debug)]
 pub enum SchedulerError {
@@ -18,28 +19,36 @@ pub enum SchedulerError {
     EventSend(String),
     #[error("Event receive error: {0}")]
     EventReceive(String),
+    #[error("Task not found: {0}")]
+    TaskNotFound(TaskId),
 }
 
 pub trait EventType: Send + Sync + Clone + Hash + Eq {}
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ExecutionMode {
-    Background,
-    EventDriven,
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct TaskId(Uuid);
+
+impl TaskId {
+    pub fn new() -> Self {
+        Self(Uuid::new_v4())
+    }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ExecutionStatus {
-    Idle,
-    Running,
-    Stopped,
-    Failed,
+impl Default for TaskId {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl std::fmt::Display for TaskId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
 }
 
 #[async_trait]
 pub trait Executable: Send + Sync {
     fn name(&self) -> &str;
-    fn status(&self) -> ExecutionStatus;
 
     async fn initialize(&mut self) -> Result<(), SchedulerError>;
     async fn shutdown(&mut self) -> Result<(), SchedulerError>;
@@ -48,16 +57,12 @@ pub trait Executable: Send + Sync {
 #[async_trait]
 pub trait BackgroundTask: Executable {
     async fn execute(&mut self) -> Result<(), SchedulerError>;
-
-    fn clone_box(&self) -> Box<dyn BackgroundTask>;
 }
 
 #[async_trait]
-pub trait EventDrivenTask<E: EventType + 'static>: Executable {
+pub trait EventTask<E: EventType + 'static>: Executable {
     fn subscribed_event(&self) -> &E;
     async fn handle_event(&mut self, event: String) -> Result<(), SchedulerError>;
-
-    fn clone_box(&self) -> Box<dyn EventDrivenTask<E>>;
 }
 
 #[derive(Debug, Clone)]
@@ -118,17 +123,59 @@ impl<E: EventType + 'static + ToString> EventBus<E> {
     }
 }
 
+pub struct TaskRegistry<E> {
+    background_tasks: HashMap<TaskId, Arc<Mutex<dyn BackgroundTask>>>,
+    event_tasks: HashMap<TaskId, Arc<Mutex<dyn EventTask<E>>>>,
+}
+
+impl<E: EventType + 'static + ToString> Default for TaskRegistry<E> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<E: EventType + 'static + ToString> TaskRegistry<E> {
+    pub fn new() -> Self {
+        Self {
+            background_tasks: HashMap::new(),
+            event_tasks: HashMap::new(),
+        }
+    }
+
+    pub fn register_background_task(&mut self, task: Arc<Mutex<dyn BackgroundTask>>) -> TaskId {
+        let id = TaskId::new();
+        self.background_tasks.insert(id.clone(), task);
+        id
+    }
+
+    pub fn register_event_task(&mut self, task: Arc<Mutex<dyn EventTask<E>>>) -> TaskId {
+        let id = TaskId::new();
+        self.event_tasks.insert(id.clone(), task);
+        id
+    }
+
+    pub fn get_background_task(&self, id: &TaskId) -> Option<Arc<Mutex<dyn BackgroundTask>>> {
+        self.background_tasks.get(id).cloned()
+    }
+
+    pub fn get_event_task(&self, id: &TaskId) -> Option<Arc<Mutex<dyn EventTask<E>>>> {
+        self.event_tasks.get(id).cloned()
+    }
+}
+
 pub struct Scheduler<E> {
-    background_tasks: Vec<Box<dyn BackgroundTask>>,
-    event_driven_tasks: Vec<Box<dyn EventDrivenTask<E>>>,
+    task_registry: TaskRegistry<E>,
+    background_task_ids: Vec<TaskId>,
+    event_task_ids: Vec<TaskId>,
     event_bus: EventBus<E>,
 }
 
 impl<E: EventType + 'static + ToString> Scheduler<E> {
     pub fn new(event_bus: EventBus<E>) -> Self {
         Self {
-            background_tasks: Vec::new(),
-            event_driven_tasks: Vec::new(),
+            task_registry: TaskRegistry::new(),
+            background_task_ids: Vec::new(),
+            event_task_ids: Vec::new(),
             event_bus,
         }
     }
@@ -137,34 +184,53 @@ impl<E: EventType + 'static + ToString> Scheduler<E> {
         &self.event_bus
     }
 
-    pub fn register_background_task(&mut self, task: Box<dyn BackgroundTask>) {
-        self.background_tasks.push(task);
+    pub fn register_background_task(&mut self, task: Arc<Mutex<dyn BackgroundTask>>) -> TaskId {
+        let id = self.task_registry.register_background_task(task);
+        self.background_task_ids.push(id.clone());
+        id
     }
 
-    pub fn register_event_driven_task(&mut self, task: Box<dyn EventDrivenTask<E>>) {
-        self.event_driven_tasks.push(task);
+    pub fn register_event_task(&mut self, task: Arc<Mutex<dyn EventTask<E>>>) -> TaskId {
+        let id = self.task_registry.register_event_task(task);
+        self.event_task_ids.push(id.clone());
+        id
     }
 
     pub async fn start(&mut self) -> Result<(), SchedulerError> {
-        for task in self.background_tasks.iter_mut() {
-            task.initialize().await?;
-            let mut task_clone = task.clone_box();
+        for id in &self.background_task_ids {
+            let task = self
+                .task_registry
+                .get_background_task(id)
+                .ok_or_else(|| SchedulerError::TaskNotFound(id.clone()))?;
+
+            task.lock().await.initialize().await?;
+
+            let task_clone = task.clone();
             tokio::spawn(async move {
                 loop {
-                    if let Err(e) = task_clone.execute().await {
+                    if let Err(e) = task_clone.lock().await.execute().await {
                         eprintln!("Background task execution error: {}", e);
                     }
                 }
             });
         }
 
-        for task in self.event_driven_tasks.iter_mut() {
-            task.initialize().await?;
-            if let Ok(mut rx) = self.event_bus.subscribe(task.subscribed_event()) {
-                let mut task_clone = task.clone_box();
+        for id in &self.event_task_ids {
+            let task = self
+                .task_registry
+                .get_event_task(id)
+                .ok_or_else(|| SchedulerError::TaskNotFound(id.clone()))?;
+
+            let mut task_lock = task.lock().await;
+            task_lock.initialize().await?;
+            let event = task_lock.subscribed_event().clone();
+            drop(task_lock);
+
+            if let Ok(mut rx) = self.event_bus.subscribe(&event) {
+                let task_clone = task.clone();
                 tokio::spawn(async move {
-                    while let Ok(event) = rx.recv().await {
-                        if let Err(e) = task_clone.handle_event(event).await {
+                    while let Ok(event_data) = rx.recv().await {
+                        if let Err(e) = task_clone.lock().await.handle_event(event_data).await {
                             eprintln!("Event handling error: {}", e);
                         }
                     }
@@ -176,12 +242,16 @@ impl<E: EventType + 'static + ToString> Scheduler<E> {
     }
 
     pub async fn shutdown(&mut self) -> Result<(), SchedulerError> {
-        for task in self.background_tasks.iter_mut() {
-            task.shutdown().await?;
+        for id in &self.background_task_ids {
+            if let Some(task) = self.task_registry.get_background_task(id) {
+                task.lock().await.shutdown().await?;
+            }
         }
 
-        for task in self.event_driven_tasks.iter_mut() {
-            task.shutdown().await?;
+        for id in &self.event_task_ids {
+            if let Some(task) = self.task_registry.get_event_task(id) {
+                task.lock().await.shutdown().await?;
+            }
         }
 
         Ok(())
@@ -211,10 +281,17 @@ mod tests {
 
     impl EventType for TestEvent {}
 
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum TestStatus {
+        Idle,
+        Running,
+        Stopped,
+    }
+
     struct BackgroundTestTask {
         name: String,
-        status: ExecutionStatus,
-        status_test: Arc<Mutex<ExecutionStatus>>,
+        status: TestStatus,
+        status_inner: Arc<Mutex<TestStatus>>,
     }
 
     #[async_trait]
@@ -223,19 +300,15 @@ mod tests {
             &self.name
         }
 
-        fn status(&self) -> ExecutionStatus {
-            self.status
-        }
-
         async fn initialize(&mut self) -> Result<(), SchedulerError> {
-            *self.status_test.lock().await = ExecutionStatus::Running;
-            self.status = ExecutionStatus::Running;
+            *self.status_inner.lock().await = TestStatus::Running;
+            self.status = TestStatus::Running;
             Ok(())
         }
 
         async fn shutdown(&mut self) -> Result<(), SchedulerError> {
-            *self.status_test.lock().await = ExecutionStatus::Stopped;
-            self.status = ExecutionStatus::Stopped;
+            *self.status_inner.lock().await = TestStatus::Stopped;
+            self.status = TestStatus::Stopped;
             Ok(())
         }
     }
@@ -246,49 +319,37 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
             Ok(())
         }
-
-        fn clone_box(&self) -> Box<dyn BackgroundTask> {
-            Box::new(Self {
-                name: self.name.clone(),
-                status: self.status,
-                status_test: self.status_test.clone(),
-            })
-        }
     }
 
-    struct EventDrivenTestTask {
+    struct EventTestTask {
         name: String,
-        status: ExecutionStatus,
-        status_test: Arc<Mutex<ExecutionStatus>>,
+        status: TestStatus,
+        status_inner: Arc<Mutex<TestStatus>>,
         event: TestEvent,
         received_events: Arc<Mutex<Vec<String>>>,
     }
 
     #[async_trait]
-    impl Executable for EventDrivenTestTask {
+    impl Executable for EventTestTask {
         fn name(&self) -> &str {
             &self.name
         }
 
-        fn status(&self) -> ExecutionStatus {
-            self.status
-        }
-
         async fn initialize(&mut self) -> Result<(), SchedulerError> {
-            *self.status_test.lock().await = ExecutionStatus::Running;
-            self.status = ExecutionStatus::Running;
+            *self.status_inner.lock().await = TestStatus::Running;
+            self.status = TestStatus::Running;
             Ok(())
         }
 
         async fn shutdown(&mut self) -> Result<(), SchedulerError> {
-            *self.status_test.lock().await = ExecutionStatus::Stopped;
-            self.status = ExecutionStatus::Stopped;
+            *self.status_inner.lock().await = TestStatus::Stopped;
+            self.status = TestStatus::Stopped;
             Ok(())
         }
     }
 
     #[async_trait]
-    impl EventDrivenTask<TestEvent> for EventDrivenTestTask {
+    impl EventTask<TestEvent> for EventTestTask {
         fn subscribed_event(&self) -> &TestEvent {
             &self.event
         }
@@ -297,20 +358,81 @@ mod tests {
             self.received_events.lock().await.push(event);
             Ok(())
         }
-
-        fn clone_box(&self) -> Box<dyn EventDrivenTask<TestEvent>> {
-            Box::new(Self {
-                name: self.name.clone(),
-                status: self.status,
-                status_test: self.status_test.clone(),
-                event: self.event.clone(),
-                received_events: self.received_events.clone(),
-            })
-        }
     }
 
     #[tokio::test]
-    async fn test_event_bus_channel_creation() {
+    async fn test_event_bus_creation() {
+        let event_bus = EventBus::<TestEvent>::new(vec![
+            (
+                TestEvent::EventA,
+                ChannelConfig {
+                    capacity: 10,
+                    description: "Channel A".to_string(),
+                },
+            ),
+            (
+                TestEvent::EventB,
+                ChannelConfig {
+                    capacity: 20,
+                    description: "Channel B".to_string(),
+                },
+            ),
+        ]);
+
+        assert_eq!(event_bus.channel_count(), 2);
+        assert!(event_bus.clone_sender(&TestEvent::EventA).is_ok());
+        assert!(event_bus.clone_sender(&TestEvent::EventB).is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_task_registration() {
+        let mut registry = TaskRegistry::<TestEvent>::new();
+
+        let bg_task = Arc::new(Mutex::new(BackgroundTestTask {
+            name: "bg_task".to_string(),
+            status: TestStatus::Idle,
+            status_inner: Arc::new(Mutex::new(TestStatus::Idle)),
+        }));
+
+        let event_task = Arc::new(Mutex::new(EventTestTask {
+            name: "event_task".to_string(),
+            status: TestStatus::Idle,
+            status_inner: Arc::new(Mutex::new(TestStatus::Idle)),
+            event: TestEvent::EventA,
+            received_events: Arc::new(Mutex::new(Vec::new())),
+        }));
+
+        let bg_id = registry.register_background_task(bg_task.clone());
+        let event_id = registry.register_event_task(event_task.clone());
+
+        assert!(registry.get_background_task(&bg_id).is_some());
+        assert!(registry.get_event_task(&event_id).is_some());
+    }
+
+    #[tokio::test]
+    async fn test_background_task_lifecycle() {
+        let status = Arc::new(Mutex::new(TestStatus::Idle));
+        let task = Arc::new(Mutex::new(BackgroundTestTask {
+            name: "bg_task".to_string(),
+            status: TestStatus::Idle,
+            status_inner: status.clone(),
+        }));
+
+        let mut scheduler = Scheduler::new(EventBus::<TestEvent>::new(vec![]));
+        scheduler.register_background_task(task.clone());
+
+        // Test initialization
+        scheduler.start().await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert_eq!(*status.lock().await, TestStatus::Running);
+
+        // Test shutdown
+        scheduler.shutdown().await.unwrap();
+        assert_eq!(*status.lock().await, TestStatus::Stopped);
+    }
+
+    #[tokio::test]
+    async fn test_event_task_handling() {
         let event_bus = EventBus::<TestEvent>::new(vec![(
             TestEvent::EventA,
             ChannelConfig {
@@ -319,64 +441,51 @@ mod tests {
             },
         )]);
 
-        assert_eq!(event_bus.channel_count(), 1);
-        assert!(event_bus.channel_config(0).is_some());
-    }
-
-    #[tokio::test]
-    async fn test_scheduler_background_task() {
-        let status = Arc::new(Mutex::new(ExecutionStatus::Idle));
-
-        let task = BackgroundTestTask {
-            name: "BackgroundTask".to_string(),
-            status: ExecutionStatus::Idle,
-            status_test: status.clone(),
-        };
-
-        let mut scheduler = Scheduler::new(EventBus::<TestEvent>::new(vec![]));
-        scheduler.register_background_task(Box::new(task));
-        scheduler.start().await.unwrap();
-
-        // Give the task time to start
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-
-        assert_eq!(*status.lock().await, ExecutionStatus::Running);
-    }
-
-    #[tokio::test]
-    async fn test_scheduler_event_driven_task() {
-        let event_bus = EventBus::<TestEvent>::new(vec![(
-            TestEvent::EventB,
-            ChannelConfig {
-                capacity: 10,
-                description: "Test channel".to_string(),
-            },
-        )]);
-
-        let status = Arc::new(Mutex::new(ExecutionStatus::Idle));
+        let status = Arc::new(Mutex::new(TestStatus::Idle));
         let received_events = Arc::new(Mutex::new(Vec::new()));
-        let task = EventDrivenTestTask {
-            name: "EventDrivenTask".to_string(),
-            status: ExecutionStatus::Idle,
-            status_test: status.clone(),
-            event: TestEvent::EventB,
+        let task = Arc::new(Mutex::new(EventTestTask {
+            name: "event_task".to_string(),
+            status: TestStatus::Idle,
+            status_inner: status.clone(),
+            event: TestEvent::EventA,
             received_events: received_events.clone(),
-        };
+        }));
 
         let mut scheduler = Scheduler::new(event_bus);
-        scheduler.register_event_driven_task(Box::new(task));
+        scheduler.register_event_task(task.clone());
         scheduler.start().await.unwrap();
 
-        // Send an event
-        if let Some(sender) = scheduler.event_bus.channels.get(&TestEvent::EventB) {
-            sender.send("Test message".to_string()).unwrap();
+        // Send multiple events
+        let sender = scheduler
+            .event_bus()
+            .clone_sender(&TestEvent::EventA)
+            .unwrap();
+        for i in 0..5 {
+            sender.send(format!("event_{}", i)).unwrap();
         }
 
-        // Give the task time to process
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
         let events = received_events.lock().await;
-        assert_eq!(events.len(), 1);
-        assert_eq!(events[0], "Test message");
+        assert_eq!(events.len(), 5);
+        for i in 0..5 {
+            assert_eq!(events[i], format!("event_{}", i));
+        }
+    }
+
+    #[tokio::test]
+    async fn test_scheduler_error_handling() {
+        let scheduler = Scheduler::new(EventBus::<TestEvent>::new(vec![]));
+
+        // Test invalid task lookup
+        let result = scheduler
+            .task_registry
+            .get_background_task(&TaskId::new())
+            .is_none();
+        assert!(result);
+
+        // Test invalid channel
+        let event_bus = EventBus::<TestEvent>::new(vec![]);
+        assert!(event_bus.clone_sender(&TestEvent::EventA).is_err());
     }
 }
